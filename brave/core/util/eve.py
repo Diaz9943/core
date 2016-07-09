@@ -35,6 +35,7 @@ As a few examples:
 from __future__ import print_function
 
 import requests
+from web.core import config
 
 from hashlib import sha256
 from datetime import datetime
@@ -42,8 +43,9 @@ from relaxml import xml
 from marrow.util.bunch import Bunch
 from marrow.util.convert import boolean, number, array
 from marrow.templating.serialize.bencode import EnhancedBencode
-from mongoengine import Document, IntField, StringField, ListField, DateTimeField, DictField, BooleanField, MapField
-from brave.api.client import bunchify as bunchify_lite
+from mongoengine import Document, IntField, StringField, ListField, DateTimeField, DictField, BooleanField, MapField, \
+    NotUniqueError
+from braveapi.client import bunchify as bunchify_lite
 
 
 log = __import__('logging').getLogger(__name__)
@@ -158,7 +160,7 @@ class APICall(Document):
         allow_inheritance = False,
         collection = "APICall",
         indexes = [
-                dict(fields=['name', 'mask'], unique=True),
+                dict(fields=['name', '_mask'], unique=True),
             ]
     )
     
@@ -169,8 +171,29 @@ class APICall(Document):
             ('o', "Corporation")
         )))
     description = StringField()
-    mask = IntField()
+    _mask = IntField(db_field="mask")
     group = IntField()
+    # Allow for the name of an APICall to be different from the URI in certain circumstances
+    uriname = StringField()
+    
+    @property
+    def mask(self):
+        """Returns a Key Mask object instead of just the integer."""
+        
+        if self.kind == "Meta" or self.kind == "m":
+            return EVECharacterKeyMask(self._mask)
+        elif self.kind == "Character" or self.kind == "c":
+            return EVECharacterKeyMask(self._mask)
+        elif self.kind == "Corporation" or self.kind == "o":
+            return EVECorporationKeyMask(self._mask)
+        else:
+            log.info("Incorrect APICall type %s for APICall %s.", self.kind, self.name)
+            return None
+        
+    @mask.setter
+    def mask(self, value):
+        """Sets the value of the Key Mask"""
+        self._mask = value
     
     def __repr__(self):
         return 'APICall(%s, %s)' % (self.name, self.mask or "N/A")
@@ -187,7 +210,10 @@ class APICall(Document):
             raise Exception("The only positional parameter allowed is the credentials object.")
         
         now = datetime.utcnow()
-        uri = self.uri(self.name)
+        if not self.uriname:
+            uri = self.uri(self.name)
+        else:
+            uri = self.uri(self.uriname)
         
         # Define the keyID/vCode API key arguments, if we have credentials.
         if credential:
@@ -210,9 +236,12 @@ class APICall(Document):
             return bunchify_lite(cv.result)
         
         log.info("Making query to %s for key ID %d.", self.name, payload.get('keyID', -1))
-        
+
+        # Provide a User-Agent because CCP asks us to.
+        headers = {'User-Agent': 'BRAVE Core Auth; Operated by: {0}'.format(config['core.operator'])}
+
         # Actually perform the query if a cached version could not be found.
-        response = requests.post(uri, data=payload or None)
+        response = requests.post(uri, data=payload or None, headers=headers)
         response.raise_for_status()
         
         # We don't want the initial XML prefix.  We should still check it, though.
@@ -220,6 +249,10 @@ class APICall(Document):
         
         if prefix.strip() != "<?xml version='1.0' encoding='UTF-8'?>":
             raise Exception("Data returned doesn't seem to be XML!")
+        
+        # Encode in UTF-8 to prevent a bug when converting from CML to a dict.
+        if isinstance(data, unicode):
+            data = data.encode('UTF-8')
         
         data = xml(data)['eveapi']
         result = bunchify(data['result'], 'result')
@@ -330,8 +363,98 @@ def populate_calls(force=False):
         APIGroup(row.groupID, row.name, row.description).save()
     
     for row in result.calls.row:
-        APICall(row.type.lower()[:4] + '.' + row.name,
-            type_mapping[row.type],
-            row.description,
-            row.accessMask,
-            row.groupID).save()
+        try:
+            if row.type.lower()[:4] == 'char' and row.name == 'CharacterInfo':
+                APICall(row.type.lower()[:4] + '.' + row.name + ('Public' if row.accessMask == 8388608 else 'Private'),
+                    type_mapping[row.type],
+                    row.description,
+                    row.accessMask,
+                    row.groupID,
+                    'eve.CharacterInfo').save()
+            else:
+                APICall(row.type.lower()[:4] + '.' + row.name,
+                    type_mapping[row.type],
+                    row.description,
+                    row.accessMask,
+                    row.groupID).save()
+        except NotUniqueError:
+            log.info('Call {0} already populated, ignoring'.format(row.name))
+            
+            
+    """Classes for storing, interpreting, and comparing key masks."""
+            
+class EVEKeyMask:
+    """Base class for representing API key masks."""
+    
+    NULL = 0
+    
+    def __init__(self, mask):
+        self.mask = mask
+        
+    def __repr__(self):
+        return 'EVEKeyMask({0})'.format(self.mask)
+
+    def __nonzero__(self):
+        if self.mask:
+            return True
+        return False
+        
+    def has_access(self, mask):
+        if isinstance(mask, EVEKeyMask):
+            mask = mask.mask
+        if self.mask & mask == mask:
+            return True
+            
+        return False
+        
+    def has_multiple_access(self, masks):
+        for apiCall in masks:
+            if not self.has_access(apiCall):
+                return False
+        
+        return True
+        
+    def number_of_functions(self):
+        """Counts the number of ones in the binary representation of the mask."""
+        """This is equivalent to the number of functions that the key provides"""
+        """access to as long as the mask is a real mask."""
+        return bin(self.mask).count('1')
+        
+    def functionsAllowed(self):
+        """Returns a list with the APICall object of all the functions permitted by this mask."""
+        
+        funcs = []
+        if not self.functions():
+            return funcs
+            
+        for function in self.functions():
+            if self.has_access(function.mask.mask):
+                funcs.append(function)
+        
+        return funcs
+    
+    @staticmethod
+    def functions():
+        return None
+        
+
+class EVECharacterKeyMask(EVEKeyMask):
+    """Class for comparing character key masks against the required API calls."""
+    
+    def __repr__(self):
+        return 'EVECharacterKeyMask({0})'.format(self.mask)
+        
+    @staticmethod
+    def functions():
+        return APICall.objects(kind='c').order_by('mask')
+    
+    
+class EVECorporationKeyMask(EVEKeyMask):
+    """Class for comparing corporation key masks against the required API calls."""
+    
+    def __repr__(self):
+        return 'EVECorporationKeyMask({0})'.format(self.mask)
+        
+    @staticmethod
+    def functions():
+        return APICall.objects(kind='o').order_by('mask')

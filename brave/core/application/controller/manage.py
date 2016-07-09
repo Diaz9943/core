@@ -14,26 +14,37 @@ from web.core.http import HTTPFound, HTTPNotFound
 
 from brave.core.application.model import Application
 from brave.core.application.form import manage_form
-from brave.core.util.predicate import authorize, authenticated, is_administrator
+from brave.core.util.predicate import authenticate
+from brave.core.permission.util import user_has_permission
+from brave.core.permission.model import Permission
+from brave.core.permission.controller import createPerms
 
 
 log = __import__('logging').getLogger(__name__)
 
 
-class OwnApplicationInterface(HTTPMethod):
+class ApplicationInterface(HTTPMethod):
     def __init__(self, app):
-        super(OwnApplicationInterface, self).__init__()
+        super(ApplicationInterface, self).__init__()
         
         try:
             self.app = Application.objects.get(id=app)
         except Application.DoesNotExist:
             raise HTTPNotFound()
 
-        if self.app.owner.id != user.id:
+        if self.app.owner.id != user.id and not user.has_permission(self.app.edit_perm):
             raise HTTPNotFound()
     
     def get(self):
         app = self.app
+        
+        perms = ""
+        
+        for p in Permission.objects(id__startswith=(app.short + ".")):
+            desc = p.description
+            if not desc:
+                desc = "None"
+            perms += p.id + ":" + desc + "\n"
         
         if request.is_xhr:
             return 'brave.core.template.form', dict(
@@ -44,18 +55,24 @@ class OwnApplicationInterface(HTTPMethod):
                             description = app.description,
                             site = app.site,
                             contact = app.contact,
+                            development = app.development,
                             key = dict(
                                     public = app.key.public,
                                     private = app.key.private,
                                 ),
                             required = app.mask.required,
                             optional = app.mask.optional,
-                            groups = app.groups
+                            groups = app.groups,
+                            short = app.short,
+                            perms=perms,
+                            expire = app.expireGrantDays,
+                            all_chars = app.require_all_chars,
+                            only_one_char = app.auth_only_one_char,
                         )
                 )
         
         key = SigningKey.from_string(unhexlify(app.key.private), curve=NIST256p, hashfunc=sha256)
-        return 'brave.core.application.template.view_own_app', dict(
+        return 'brave.core.application.template.view_app', dict(
                 app = app,
                 key = hexlify(key.get_verifying_key().to_string()),
                 pem = key.get_verifying_key().to_pem()
@@ -68,7 +85,13 @@ class OwnApplicationInterface(HTTPMethod):
         app = self.app
         valid, invalid = manage_form().native(kw)
         
-        for k in ('name', 'description', 'groups', 'site', 'contact'):
+        # No dots in application shorts
+        if '.' in valid['short']:
+            return 'json:', dict(
+                    success=False,
+                    message=_("Stop being bad and remove the periods in your app short."))
+        
+        for k in ('name', 'description', 'groups', 'site', 'contact', 'development'):
             setattr(app, k, valid[k])
         
         if valid['key']['public'].startswith('-'):
@@ -78,6 +101,24 @@ class OwnApplicationInterface(HTTPMethod):
         app.key.public = valid['key']['public']
         app.mask.required = valid['required'] or 0
         app.mask.optional = valid['optional'] or 0
+        # Ignore their provided app short because we can't change permission names #ThanksMongo
+        
+        if user.admin:
+            app.expireGrantDays = valid['expire'] or 30
+            
+        app.short = valid['short'] or app.name.replace(" ", "").lower()
+
+        if valid['all_chars'] and valid['only_one_char']:
+            return 'json:', dict(
+                    success=False,
+                    message=_("Cannot require both all characters and only one character"))
+        app.require_all_chars = valid['all_chars'] or False
+        app.auth_only_one_char = valid['only_one_char'] or False
+
+        if valid['perms'] and not createPerms(valid['perms'], app.short):
+            return 'json:', dict(
+                    success=False,
+                    message=_("Stop being bad and only include permissions for your app."))
         
         app.save()
         
@@ -86,7 +127,7 @@ class OwnApplicationInterface(HTTPMethod):
             )
     
     def delete(self):
-        log.info("APPDEL %r %r", self.app, self.app.owner)
+        log.info("Deleted application %s owned by %s", self.app, self.app.owner)
         
         self.app.delete()
 
@@ -99,9 +140,17 @@ class OwnApplicationInterface(HTTPMethod):
         raise HTTPFound(location='/application/manage/')
 
 
-class OwnApplicationList(HTTPMethod):
-    @authorize(authenticated)
+class ApplicationList(HTTPMethod):
+    @authenticate
     def get(self):
+        adminRecords = set()
+        
+        user_perms = user.permissions
+        
+        for app in Application.objects():
+            if app.owner.id != user.id and Permission.set_grants_permission(user_perms, app.edit_perm):
+                adminRecords.add(app)
+        
         records = Application.objects(owner=user._current_obj())
         
         if request.is_xhr:
@@ -111,12 +160,13 @@ class OwnApplicationList(HTTPMethod):
                     data = None,
                 )
         
-        return 'brave.core.application.template.list_own_apps', dict(
+        return 'brave.core.application.template.manage_apps', dict(
                 area = 'apps',
-                records = records
+                records = records,
+                adminRecords = adminRecords
             )
     
-    @authorize(authenticated)
+    @user_has_permission(Application.CREATE_PERM)
     def post(self, **kw):
         if not request.is_xhr:
             raise HTTPNotFound()
@@ -124,11 +174,47 @@ class OwnApplicationList(HTTPMethod):
         u = user._current_obj()
         valid, invalid = manage_form().native(kw)
         
+        # No dots in application shorts
+        if '.' in valid['short']:
+            return 'json:', dict(
+                    success=False,
+                    message=_("Stop being bad and remove the periods in your app short."))
+                    
+        if len(Application.objects(short=valid['short'])):
+            return 'json:', dict(
+                    success=False,
+                    message=_("An application with this permission name already exists."))
+
         app = Application(owner=u, **{k: v for k, v in valid.iteritems() if k in ('name', 'description', 'groups', 'site', 'contact')})
         
         app.key.public = valid['key']['public']
         app.mask.required = valid['required'] or 0
         app.mask.optional = valid['optional'] or 0
+
+        if valid['all_chars'] and valid['only_one_char']:
+            return 'json:', dict(
+                    success=False,
+                    message=_("Cannot require both all characters and only one character"))
+        app.require_all_chars = valid['all_chars'] or False
+        app.auth_only_one_char = valid['only_one_char'] or False
+        
+        if valid['development'] == "true" or valid['development'] == "True":
+            app.development = True
+        else:
+            app.development = False
+
+        app.short = valid['short'] or app.name.replace(" ", "").lower()
+        
+        if valid['perms'] and not createPerms(valid['perms'], app.short):
+            return 'json:', dict(
+                    success=False,
+                    message=_("Stop being bad and only include permissions for your app."))
+        
+        p = Permission('core.application.authorize.{0}'.format(app.short), "Ability to authorize application {0}".format(app.name))
+        p.save()
+        if u.primary:
+            u.primary.personal_permissions.append(p)
+        u.primary.save()
         
         app.save()
         
@@ -139,8 +225,8 @@ class OwnApplicationList(HTTPMethod):
 
 
 class ManagementController(Controller):
-    index = OwnApplicationList()
+    index = ApplicationList()
     
     def __lookup__(self, app, *args, **kw):
         request.path_info_pop()  # We consume a single path element.
-        return OwnApplicationInterface(app), args
+        return ApplicationInterface(app), args

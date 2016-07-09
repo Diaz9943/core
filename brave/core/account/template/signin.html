@@ -67,6 +67,10 @@
     </script>
 </%block>
 
+% if 'EVE-IGB' in web.request.headers.get('User-Agent'):
+    Brave IT Services no longer supports the EVE In Game Browser due to security issues. Please use an out of game browser.
+% else:
+
 <div class="span4 box">
     <div class="content-wrap authentication">
         <h6>${_("Authentication")}</h6>
@@ -78,7 +82,7 @@
         <div class="overlay fa-4x result success"><i class="fa fa-check fa-4x"></i></div>
 
         <div class="span6" style="margin: 0; text-align: left;">
-            <a href="#">${_("Password Recovery")}</a><br><a href="/account/register">${_("Create Account")}</a>
+            <a href="/account/recover">${_("Password Recovery")}</a><br><a href="/account/register">${_("Create Account")}</a>
         </div>
         <div class="span6" style="text-align: right;">
             <button class="btn-glow primary" id="submit">${_("Sign In")}</button>
@@ -86,3 +90,4 @@
         <div class="clearfix"></div>
     </div>
 </div>
+% endif
